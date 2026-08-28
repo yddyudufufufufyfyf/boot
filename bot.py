@@ -1,6 +1,6 @@
 import os
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 import telebot
 from telebot import types
 from threading import Thread
@@ -28,11 +28,11 @@ ADMIN_USERNAME = "@GD_GQ"
 
 bot = telebot.TeleBot(TOKEN)
 
-# --- رابط قاعدة البيانات السحابية (Supabase) مع كلمة المرور الخاصة بك ---
-DATABASE_URL = "postgresql://postgres:Amgd@@@@####5@db.kenzoztnvvxqhbebgwgj.supabase.co:5432/postgres"
+# --- رابط قاعدة البيانات السحابية (Supabase) مع كلمة المرور ---
+DATABASE_URL = "postgresql://postgres:amgd@@@@####5@db.kenzoztnvvxqhbebgwgj.supabase.co:5432/postgres"
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 def init_db():
     conn = get_db()
