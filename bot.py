@@ -28,8 +28,8 @@ ADMIN_USERNAME = "@GD_GQ"
 
 bot = telebot.TeleBot(TOKEN)
 
-# --- رابط قاعدة البيانات السحابية (Supabase) مع تشفير الرموز الخاصة في كلمة المرور ---
-DATABASE_URL = "postgresql://postgres:amgd%40%40%40%40####5@db.kenzoztnvvxqhbebgwgj.supabase.co:5432/postgres"
+# --- رابط قاعدة البيانات الصحيح والنهائي (بمنفذ 6543) ---
+DATABASE_URL = "postgresql://postgres.kenzoztnvvxqhbebgwgj:amgd%40%40%40%40####5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres"
 
 def get_db():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
