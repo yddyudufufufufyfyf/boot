@@ -11,7 +11,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running 24/7 with Supabase & Inline Menus!"
+    return "Bot is running 24/7 with Supabase & Admin Panel!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -28,7 +28,7 @@ ADMIN_USERNAME = "@GD_GQ"
 
 bot = telebot.TeleBot(TOKEN)
 
-# --- رابط قاعدة البيانات الصحيح والنهائي (بمنفذ 6543) ---
+# --- رابط قاعدة البيانات (Pooler Port 6543) ---
 DATABASE_URL = "postgresql://postgres.kenzoztnvvxqhbebgwgj:amgd%40%40%40%40####5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres"
 
 def get_db():
@@ -85,6 +85,7 @@ def init_db():
         )
     ''')
 
+    # جعل الآدمن مسجلاً تلقائياً كموزع ومعتمد
     cursor.execute("INSERT INTO users (user_id, balance, is_authorized, user_type) VALUES (%s, 999999.0, 1, 'reseller') ON CONFLICT (user_id) DO UPDATE SET is_authorized = 1, user_type='reseller'", (ADMIN_ID,))
 
     conn.commit()
@@ -101,6 +102,14 @@ def get_setting(key, default=""):
     cursor.close()
     conn.close()
     return row['value'] if row else default
+
+def update_setting(key, value):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, str(value)))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def check_forced_subs(user_id):
     if user_id == ADMIN_ID:
@@ -132,12 +141,12 @@ def send_forced_channels_message(chat_id):
 
     markup = types.InlineKeyboardMarkup()
     for ch in channels:
-        markup.add(types.InlineKeyboardButton(f"اشترك في قنواتنا 📢", url=f"https://t.me/{ch['channel_username'].lstrip('@')}"))
+        markup.add(types.InlineKeyboardButton("اشترك في القناة 📢", url=f"https://t.me/{ch['channel_username'].lstrip('@')}"))
     markup.add(types.InlineKeyboardButton("تحقق من الاشتراك ✅", callback_data="check_sub"))
 
     bot.send_message(
         chat_id,
-        "⚠️ عذراً، يجب عليك الاشتراكات في القنوات الإجبارية لتتمكن من استخدام البوت.\n"
+        "⚠️ عذراً، يجب عليك الاشتراك في القنوات الإجبارية لتتمكن من استخدام البوت.\n"
         "يرجى الاشتراك في القنوات أدناه ثم اضغط 'تحقق من الاشتراك':",
         reply_markup=markup
     )
@@ -156,6 +165,9 @@ def start_cmd(message):
         ref_id = int(args[1])
         if ref_id != user_id:
             invited_by = ref_id
+            # مكافأة دعوة الأصدقاء يحددها الآدمن
+            reward_val = float(get_setting('ref_reward', '0.5'))
+            cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (reward_val, ref_id))
 
     if username:
         cursor.execute("""
@@ -181,14 +193,20 @@ def show_start_options(chat_id, message_id=None):
         types.InlineKeyboardButton("👔 أريد أن أكون موزعاً", callback_data="type_reseller"),
         types.InlineKeyboardButton("👤 مستخدم عادي (مجاني)", callback_data="type_normal")
     )
-    text = "👋 أهلاً بك في البوت!\n\nاختر نوع استخدامك للبوت:"
+    if user_is_admin(chat_id) or chat_id == ADMIN_ID:
+        markup.add(types.InlineKeyboardButton("⚙️ لوحة تحكم الآدمن", callback_data="adm_main_menu"))
+
+    welcome_text = get_setting('welcome_msg', 'أهلاً بك في البوت! اختر نوع استخدامك:')
     if message_id:
         try:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+            bot.edit_message_text(welcome_text, chat_id, message_id, reply_markup=markup)
         except Exception:
-            bot.send_message(chat_id, text, reply_markup=markup)
+            bot.send_message(chat_id, welcome_text, reply_markup=markup)
     else:
-        bot.send_message(chat_id, text, reply_markup=markup)
+        bot.send_message(chat_id, welcome_text, reply_markup=markup)
+
+def user_is_admin(user_id):
+    return user_id == ADMIN_ID
 
 def show_main_inline_menu(chat_id, message_id=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -199,7 +217,10 @@ def show_main_inline_menu(chat_id, message_id=None):
         types.InlineKeyboardButton("👥 تجميع رصيد (دعوة أصدقاء)", callback_data="menu_ref"),
         types.InlineKeyboardButton("📢 قنوات ربح الرصيد", callback_data="menu_earn_channels")
     )
-    text = "👋 أهلاً بك في القائمة الرئيسية!\n\nاختر من القائمة:"
+    if chat_id == ADMIN_ID:
+        markup.add(types.InlineKeyboardButton("⚙️ لوحة تحكم الآدمن", callback_data="adm_main_menu"))
+
+    text = "👋 أهلاً بك في القائمة الرئيسية للمستخدم العادي:"
     if message_id:
         try:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
@@ -211,7 +232,6 @@ def show_main_inline_menu(chat_id, message_id=None):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     user_id = call.from_user.id
-    username = call.from_user.username
     chat_id = call.message.chat.id
     message_id = call.message.message_id
     data = call.data
@@ -231,17 +251,28 @@ def callback_handler(call):
     if data == "type_reseller":
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("UPDATE users SET user_type='reseller' WHERE user_id=%s", (user_id,))
-        conn.commit()
+        cursor.execute("SELECT is_authorized, user_type FROM users WHERE user_id=%s", (user_id,))
+        row = cursor.fetchone()
         cursor.close()
         conn.close()
-        bot.edit_message_text(
-            f"عفواً، يتطلب حساب الموزع موافقة الإدارة.\n\n"
-            f"الآيدي الخاص بك: `{user_id}`\n"
-            f"يرجى مراسلة المسؤول لتفعيل حسابك كموزع:\n"
-            f"المسؤول: {ADMIN_USERNAME}",
-            chat_id, message_id, parse_mode="Markdown"
-        )
+
+        if row and row['is_authorized'] == 1:
+            show_main_inline_menu(chat_id, message_id)
+        else:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET user_type='reseller' WHERE user_id=%s", (user_id,))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            bot.answer_callback_query(call.id, "تم إرسال طلبك للإدارة بانتظار الموافقة.", show_alert=True)
+            bot.edit_message_text(
+                f"عفواً، حساب الموزع يتطلب موافقة الإدارة.\n\n"
+                f"معرفك: {user_id}\n"
+                f"تواصل مع المسؤول للتفعيل الفوري: {ADMIN_USERNAME}",
+                chat_id, message_id
+            )
 
     elif data == "type_normal":
         conn = get_db()
@@ -266,7 +297,7 @@ def callback_handler(call):
         
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
-        bot.edit_message_text(f"👤 معرفك: `{user_id}`\n💰 رصيدك الحالي: ${bal:.2f}\n\nيمكنك شحن رصيدك عبر التواصل مع المدير: {ADMIN_USERNAME}", chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+        bot.edit_message_text(f"👤 معرفك: {user_id}\n💰 رصيدك الحالي: ${bal:.2f}\n\nلشحن الرصيد تواصل مع المدير: {ADMIN_USERNAME}", chat_id, message_id, reply_markup=markup)
 
     elif data == "menu_orders":
         conn = get_db()
@@ -283,13 +314,13 @@ def callback_handler(call):
         text = "📋 مشترياتك السابقة:\n\n"
         if orders:
             for o in orders:
-                text += f"▫️ {o['name']} ⟵ `{o['code_text']}`\n"
+                text += f"▫️ {o['name']} ⟵ {o['code_text']}\n"
         else:
             text += "لا توجد طلبات سابقة."
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
 
     elif data == "menu_ref":
         bot_info = bot.get_me()
@@ -297,13 +328,13 @@ def callback_handler(call):
         reward = get_setting('ref_reward', '0.5')
         
         text = (
-            f"👥 **نظام دعوة الأصدقاء**\n\n"
-            f"شارك رابط الدعوة الخاص بك مع أصدقائك، واكسب ${reward} عن كل شخص يدخل ويشترك بالقنوات الإجبارية!\n\n"
-            f"🔗 رابطك:\n`{ref_link}`"
+            f"👥 نظام دعوة الأصدقاء\n\n"
+            f"شارك رابطك واكسب ${reward} عن كل شخص يزور البوت ويشترك بالقنوات الإجبارية!\n\n"
+            f"رابطك:\n{ref_link}"
         )
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
 
     elif data == "menu_earn_channels":
         conn = get_db()
@@ -315,10 +346,10 @@ def callback_handler(call):
 
         markup = types.InlineKeyboardMarkup()
         for ch in channels:
-            markup.add(types.InlineKeyboardButton(f"قناة: {ch['channel_username']} (ربح ${ch['reward']})", url=f"https://t.me/{ch['channel_username'].lstrip('@')}"))
+            markup.add(types.InlineKeyboardButton(f"قناة: {ch['channel_username']} (مكافأة الاشتراك)", url=f"https://t.me/{ch['channel_username'].lstrip('@')}"))
         markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
         
-        bot.edit_message_text("📢 القنوات المتاحة للاشتراك وجمع الرصيد:", chat_id, message_id, reply_markup=markup)
+        bot.edit_message_text("📢 القنوات الإجبارية المتاحة:", chat_id, message_id, reply_markup=markup)
 
     elif data == "back_to_main":
         show_main_inline_menu(chat_id, message_id)
@@ -334,13 +365,22 @@ def callback_handler(call):
         cat_id = int(data.split("_")[2])
         process_buy_code(user_id, chat_id, cat_id, call.id)
 
+    # --- لوحة تحكم الآدمن ---
     elif user_id == ADMIN_ID:
         if data == "adm_main_menu":
             show_admin_panel(chat_id, message_id)
+        elif data == "adm_resellers":
+            show_admin_resellers_panel(chat_id, message_id)
+        elif data == "adm_list_resellers":
+            list_all_resellers(chat_id, message_id)
+        elif data == "adm_store":
+            show_admin_tree(chat_id, parent_id=0, message_id=message_id)
+        elif data == "adm_settings":
+            show_admin_settings(chat_id, message_id)
         elif data == "adm_channels":
             show_admin_channels(chat_id, message_id)
         elif data == "adm_add_channel":
-            msg = bot.send_message(chat_id, "أرسل معرف القناة ورصيد المكافأة بالشكل التالي (مثال: @MyChannel 0.5):")
+            msg = bot.send_message(chat_id, "أرسل معرف القناة ورصيد المكافأة بالشكل التالي (مثال: @ChannelName 0.5):")
             bot.register_next_step_handler(msg, save_forced_channel)
         elif data.startswith("adm_delchan_"):
             chan_id = int(data.split("_")[2])
@@ -352,8 +392,6 @@ def callback_handler(call):
             conn.close()
             bot.answer_callback_query(call.id, "تم حذف القناة!")
             show_admin_channels(chat_id, message_id)
-        elif data == "adm_tree_0":
-            show_admin_tree(chat_id, parent_id=0, message_id=message_id)
         elif data.startswith("adm_tree_"):
             p_id = int(data.split("_")[2])
             show_admin_tree(chat_id, parent_id=p_id, message_id=message_id)
@@ -374,6 +412,25 @@ def callback_handler(call):
             delete_category_recursive(cat_id)
             bot.answer_callback_query(call.id, "تم الحذف بنجاح!")
             show_admin_tree(chat_id, parent_id=0, message_id=message_id)
+        elif data == "adm_set_welcome":
+            msg = bot.send_message(chat_id, "أرسل رسالة الترحيب الجديدة:")
+            bot.register_next_step_handler(msg, save_new_welcome)
+        elif data == "adm_set_ref":
+            msg = bot.send_message(chat_id, "أرسل مبلغ مكافأة دعوة الأصدقاء الجديد (مثال: 0.75):")
+            bot.register_next_step_handler(msg, save_new_ref_reward)
+        elif data == "adm_add_balance_prompt":
+            msg = bot.send_message(chat_id, "أرسل آيدي المستخدم والمبلغ بالشكل التالي (مثال: 123456789 10):")
+            bot.register_next_step_handler(msg, admin_add_balance_to_user)
+        elif data.startswith("adm_auth_"):
+            r_id = int(data.split("_")[2])
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET is_authorized=1 WHERE user_id=%s", (r_id,))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            bot.answer_callback_query(call.id, "تم تفعيل الموزع بنجاح!")
+            list_all_resellers(chat_id, message_id)
 
 @bot.message_handler(commands=['admin'])
 def admin_cmd(message):
@@ -383,14 +440,99 @@ def admin_cmd(message):
 def show_admin_panel(chat_id, message_id=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("📢 إدارة قنوات الاشتراك الإجباري والربح", callback_data="adm_channels"),
-        types.InlineKeyboardButton("📂 إدارة الأقسام والسلع والألعاب", callback_data="adm_tree_0")
+        types.InlineKeyboardButton("👔 قسم إدارة الموزعين ورصيدهم", callback_data="adm_resellers"),
+        types.InlineKeyboardButton("📂 قسم إدارة المتجر والسلع والأكواد", callback_data="adm_store"),
+        types.InlineKeyboardButton("📢 قسم قنوات الاشتراك والربح", callback_data="adm_channels"),
+        types.InlineKeyboardButton("⚙️ قسم الإعدادات العامة والترحيب", callback_data="adm_settings"),
+        types.InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")
     )
-    text = "⚙️ لوحة تحكم الآدمن:"
+    text = "⚙️ لوحة تحكم الآدمن الرئيسية:"
     if message_id:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
     else:
         bot.send_message(chat_id, text, reply_markup=markup)
+
+def show_admin_resellers_panel(chat_id, message_id=None):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📋 عرض وتفعيل الموزعين", callback_data="adm_list_resellers"),
+        types.InlineKeyboardButton("💵 إضافة/خصم رصيد لمستخدم أو موزع", callback_data="adm_add_balance_prompt"),
+        types.InlineKeyboardButton("🔙 رجوع لوحة التحكم", callback_data="adm_main_menu")
+    )
+    text = "👔 قسم إدارة الموزعين والأرصدة:"
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
+
+def list_all_resellers(chat_id, message_id=None):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE user_type='reseller'")
+    resellers = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    text = "📋 قائمة الموزعين:\n\n"
+    for r in resellers:
+        status = "✅ مفعل" if r['is_authorized'] == 1 else "⏳ بانتظار التفعيل"
+        text += f"👤 ID: `{r['user_id']}` | الرصيد: ${r['balance']:.2f} | الحالة: {status}\n"
+        if r['is_authorized'] == 0:
+            markup.add(types.InlineKeyboardButton(f"تفعيل الموزع {r['user_id']}", callback_data=f"adm_auth_{r['user_id']}"))
+
+    markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_resellers"))
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
+
+def admin_add_balance_to_user(message):
+    try:
+        parts = message.text.split()
+        u_id = int(parts[0])
+        amount = float(parts[1])
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, u_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        bot.send_message(message.chat.id, f"تم تعديل رصيد المستخدم {u_id} بمقدار ${amount:.2f} بنجاح!")
+        show_admin_resellers_panel(message.chat.id)
+    except Exception:
+        bot.send_message(message.chat.id, "خطأ بالصيغة! استخدم: الآيدي والمبلغ (مثال: 123456789 5)")
+
+def show_admin_settings(chat_id, message_id=None):
+    ref_rew = get_setting('ref_reward', '0.5')
+    welcome = get_setting('welcome_msg', '')
+    text = f"⚙️ الإعدادات الحالية:\n\n💬 رسالة الترحيب:\n{welcome}\n\n💰 مكافأة دعوة الأصدقاء: ${ref_rew}"
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("✏️ تعديل رسالة الترحيب", callback_data="adm_set_welcome"),
+        types.InlineKeyboardButton("💵 تعديل مكافأة دعوة الأصدقاء", callback_data="adm_set_ref"),
+        types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_main_menu")
+    )
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
+
+def save_new_welcome(message):
+    text = message.text.strip()
+    update_setting('welcome_msg', text)
+    bot.send_message(message.chat.id, "تم تحديث رسالة الترحيب بنجاح!")
+    show_admin_settings(message.chat.id)
+
+def save_new_ref_reward(message):
+    try:
+        val = float(message.text.strip())
+        update_setting('ref_reward', str(val))
+        bot.send_message(message.chat.id, f"تم تحديث مكافأة الدعوة إلى ${val:.2f} بنجاح!")
+        show_admin_settings(message.chat.id)
+    except Exception:
+        bot.send_message(message.chat.id, "يرجى إرسال رقم صحيح (مثال: 0.5)")
 
 def show_admin_channels(chat_id, message_id=None):
     conn = get_db()
@@ -401,12 +543,12 @@ def show_admin_channels(chat_id, message_id=None):
     conn.close()
 
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("➕ إضافة قناة جديدة", callback_data="adm_add_channel"))
+    markup.add(types.InlineKeyboardButton("➕ إضافة قناة إجبارية جديدة", callback_data="adm_add_channel"))
     for ch in channels:
-        markup.add(types.InlineKeyboardButton(f"🗑️ حذف {ch['channel_username']} (${ch['reward']})", callback_data=f"adm_delchan_{ch['id']}"))
-    markup.add(types.InlineKeyboardButton("رجوع للوحة التحكم", callback_data="adm_main_menu"))
+        markup.add(types.InlineKeyboardButton(f"🗑️ حذف {ch['channel_username']}", callback_data=f"adm_delchan_{ch['id']}"))
+    markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_main_menu"))
 
-    text = "📢 إدارة القنوات:"
+    text = "📢 إدارة القنوات الإجبارية والربح:"
     if message_id:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
     else:
@@ -416,7 +558,7 @@ def save_forced_channel(message):
     try:
         parts = message.text.split()
         ch_name = parts[0]
-        reward = float(parts[1])
+        reward = float(parts[1]) if len(parts) > 1 else 0.0
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute("INSERT INTO forced_channels (channel_username, reward) VALUES (%s, %s) ON CONFLICT (channel_username) DO UPDATE SET reward = EXCLUDED.reward", (ch_name, reward))
@@ -426,7 +568,7 @@ def save_forced_channel(message):
         bot.send_message(message.chat.id, "تمت إضافة القناة بنجاح!")
         show_admin_channels(message.chat.id)
     except Exception:
-        bot.send_message(message.chat.id, "خطأ بالصيغة! استخدم المثال: @ChannelName 0.5")
+        bot.send_message(message.chat.id, "خطأ بالصيغة! استخدم: @ChannelName 0.5")
 
 def show_user_categories(user_id, chat_id, parent_id=None, message_id=None):
     conn = get_db()
@@ -434,7 +576,7 @@ def show_user_categories(user_id, chat_id, parent_id=None, message_id=None):
 
     if parent_id is None:
         cursor.execute("SELECT * FROM categories WHERE parent_id IS NULL")
-        title = "🛒 أقسام المتجر (ببجي، بليارد، أوكسيد وغيرها):"
+        title = "🛒 أقسام المتجر:"
     else:
         cursor.execute("SELECT * FROM categories WHERE id=%s", (parent_id,))
         current_cat = cursor.fetchone()
@@ -543,7 +685,7 @@ def show_admin_tree(chat_id, parent_id=0, message_id=None):
         back_id = p['parent_id'] if p and p['parent_id'] is not None else 0
         markup.add(types.InlineKeyboardButton("رجوع للأعلى", callback_data=f"adm_tree_{back_id}"))
     else:
-        markup.add(types.InlineKeyboardButton("العودة للوحة التحكم", callback_data="adm_main_menu"))
+        markup.add(types.InlineKeyboardButton("العودة لوحة التحكم", callback_data="adm_main_menu"))
 
     cursor.close()
     conn.close()
@@ -589,7 +731,7 @@ def process_buy_code(user_id, chat_id, cat_id, callback_id):
     cursor.close()
     conn.close()
 
-    bot.send_message(chat_id, f"تم الشراء بنجاح!\n\nالسلعة: {cat['name']}\nالكود الخاص بك:\n`{code_row['code_text']}`\n\nالرصيد المتبقي: ${new_balance:.2f}", parse_mode="Markdown")
+    bot.send_message(chat_id, f"تم الشراء بنجاح!\n\nالسلعة: {cat['name']}\nالكود الخاص بك:\n{code_row['code_text']}\n\nالرصيد المتبقي: ${new_balance:.2f}")
     bot.answer_callback_query(callback_id, "تم التسليم بنجاح!")
 
 def save_new_category(message, parent_id):
