@@ -1,8 +1,26 @@
 import sqlite3
 import telebot
 from telebot import types
+import os
+from threading import Thread
+from flask import Flask
 
-# --- التوكن والآيدي المحدث ---
+# --- إعداد سيرفر الوهمي للبورت (حتى لا يفصل رندر) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running 24/7!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_web)
+    t.start()
+
+# --- التوكن والآيدي الخاص بك ---
 TOKEN = "8635700320:AAHj21exFO4kj0hKu476B7Gx0rVyOwerHZs"
 ADMIN_ID = 837914662
 ADMIN_USERNAME = "@GD_GQ"  # يوزر الآدمن / الوكيل المسؤول
@@ -20,7 +38,6 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")
     
-    # جدول المستخدمين/الموزعين
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER UNIQUE,
@@ -30,7 +47,6 @@ def init_db():
         )
     ''')
 
-    # جدول الإعدادات
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -39,7 +55,6 @@ def init_db():
     ''')
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('welcome_msg', 'أهلاً بك في بوت الموزعين! اختر القسم المطلوب:')")
 
-    # جدول الأقسام والسلع
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +64,6 @@ def init_db():
         )
     ''')
 
-    # جدول الأكواد
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +74,6 @@ def init_db():
         )
     ''')
 
-    # تفعيل الآدمن تلقائياً كموزع معتمد
     cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, is_authorized) VALUES (?, 999999.0, 1)", (ADMIN_ID,))
     cursor.execute("UPDATE users SET is_authorized = 1 WHERE user_id = ?", (ADMIN_ID,))
 
@@ -69,7 +82,6 @@ def init_db():
 
 init_db()
 
-# --- التحقق من صلاحية الموزع ---
 def is_authorized(user_id, username=None):
     if user_id == ADMIN_ID:
         return True
@@ -77,14 +89,12 @@ def is_authorized(user_id, username=None):
     conn = get_db()
     cursor = conn.cursor()
     
-    # 1. فحص بواسطة user_id
     cursor.execute("SELECT is_authorized FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     if row and row['is_authorized'] == 1:
         conn.close()
         return True
         
-    # 2. فحص بواسطة username (إذا كان مضافاً مسبقاً)
     if username:
         clean_username = username.lstrip('@').lower()
         cursor.execute("SELECT rowid, is_authorized FROM users WHERE LOWER(username) = ?", (clean_username,))
@@ -98,7 +108,6 @@ def is_authorized(user_id, username=None):
     conn.close()
     return False
 
-# --- القوائم الرئيسية ---
 def main_menu(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("🛒 الأقسام والمنتجات", "👤 حسابي ورصيدي")
@@ -107,13 +116,11 @@ def main_menu(user_id):
         markup.row("⚙️ لوحة التحكم (للآدمن)")
     return markup
 
-# --- أمر التشغيل /start ---
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     user_id = message.from_user.id
     username = message.from_user.username
 
-    # حفظ/تحديث معلومات المستخدم
     conn = get_db()
     cursor = conn.cursor()
     if username:
@@ -126,7 +133,6 @@ def start_cmd(message):
     conn.commit()
     conn.close()
     
-    # التحقق هل هو موزع معتمد؟
     if not is_authorized(user_id, username):
         safe_username = f"@{username}".replace("_", "\\_") if username else "غير محدد"
         safe_admin = ADMIN_USERNAME.replace("_", "\\_")
@@ -144,7 +150,6 @@ def start_cmd(message):
 
     bot.send_message(user_id, welcome_msg, reply_markup=main_menu(user_id))
 
-# --- معالجة الرسائل الرئيسية ---
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
     user_id = message.from_user.id
@@ -178,10 +183,6 @@ def handle_text(message):
 
     elif text == "⚙️ لوحة التحكم (للآدمن)" and user_id == ADMIN_ID:
         show_admin_panel(user_id, message.chat.id)
-
-# ==========================================
-#               تصفح الزبون
-# ==========================================
 
 def show_user_categories(user_id, chat_id, parent_id=None, message_id=None):
     conn = get_db()
@@ -244,10 +245,6 @@ def show_user_categories(user_id, chat_id, parent_id=None, message_id=None):
             bot.send_message(chat_id, title, parse_mode="Markdown", reply_markup=markup)
     else:
         bot.send_message(chat_id, title, parse_mode="Markdown", reply_markup=markup)
-
-# ==========================================
-#              لوحة تحكم الآدمن
-# ==========================================
 
 def show_admin_panel(user_id, chat_id, message_id=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -334,10 +331,6 @@ def show_admin_tree(chat_id, parent_id=0, message_id=None):
     else:
         bot.send_message(chat_id, title, parse_mode="Markdown", reply_markup=markup)
 
-# ==========================================
-#          معالجة الضغط على الأزرار
-# ==========================================
-
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     user_id = call.from_user.id
@@ -350,7 +343,6 @@ def callback_handler(call):
         bot.answer_callback_query(call.id, "❌ ليس لديك صلاحية لاستخدام البوت.", show_alert=True)
         return
 
-    # --- تنقلات الزبون ---
     if data == "usr_cat_root":
         show_user_categories(user_id, chat_id, parent_id=None, message_id=message_id)
 
@@ -362,7 +354,6 @@ def callback_handler(call):
         cat_id = int(data.split("_")[2])
         process_buy_code(user_id, chat_id, cat_id, call.id)
 
-    # --- تنقلات لوحة الآدمن ---
     elif user_id == ADMIN_ID:
         if data == "adm_main_menu":
             show_admin_panel(user_id, chat_id, message_id)
@@ -712,6 +703,9 @@ def process_edit_welcome(message):
     conn.close()
     bot.send_message(message.chat.id, "✅ تم تحديث رسالة الترحيب بنجاح!")
 
-# --- تشغيل البوت ---
-print("البوت الشجري المتكامل يعمل الآن...")
-bot.infinity_polling()
+# --- تشغيل السيرفر الوهمي والبوت معاً ---
+if __name__ == '__main__':
+    print("تشغيل خادم الويب الوهمي للحفاظ على اتصال Render...")
+    keep_alive()
+    print("البوت الشجري المتكامل يعمل الآن...")
+    bot.infinity_polling()
