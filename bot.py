@@ -1,16 +1,17 @@
-import sqlite3
+import os
+import psycopg2
+import psycopg2.extras
 import telebot
 from telebot import types
-import os
 from threading import Thread
 from flask import Flask
 
-# --- إعداد سيرفر الوهمي للبورت (حتى لا يفصل رندر) ---
+# --- إعداد سيرفر الويب الوهمي لمنع توقف رندر ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running 24/7!"
+    return "Bot is running 24/7 with Supabase & Inline Menus!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -20,30 +21,31 @@ def keep_alive():
     t = Thread(target=run_web)
     t.start()
 
-# --- التوكن والآيدي الخاص بك ---
+# --- البيانات الأساسية ---
 TOKEN = "8635700320:AAHj21exFO4kj0hKu476B7Gx0rVyOwerHZs"
 ADMIN_ID = 837914662
 ADMIN_USERNAME = "@GD_GQ"
 
 bot = telebot.TeleBot(TOKEN)
 
-# --- إعداد قاعدة البيانات ---
+# --- رابط قاعدة البيانات السحابية (Supabase) مع كلمة المرور الخاصة بك ---
+DATABASE_URL = "postgresql://postgres:Amgd@@@@####5@db.kenzoztnvvxqhbebgwgj.supabase.co:5432/postgres"
+
 def get_db():
-    conn = sqlite3.connect('bot_database.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("PRAGMA foreign_keys = ON")
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER UNIQUE,
+            user_id BIGINT UNIQUE,
             username TEXT,
             balance REAL DEFAULT 0.0,
-            is_authorized INTEGER DEFAULT 0
+            is_authorized INTEGER DEFAULT 0,
+            user_type TEXT DEFAULT NULL,
+            invited_by BIGINT DEFAULT NULL
         )
     ''')
 
@@ -53,11 +55,20 @@ def init_db():
             value TEXT
         )
     ''')
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('welcome_msg', 'أهلاً بك في بوت الموزعين! اختر القسم المطلوب:')")
+    cursor.execute("INSERT INTO settings (key, value) VALUES ('welcome_msg', 'أهلاً بك في البوت! اختر من القائمة:') ON CONFLICT (key) DO NOTHING")
+    cursor.execute("INSERT INTO settings (key, value) VALUES ('ref_reward', '0.5') ON CONFLICT (key) DO NOTHING")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS forced_channels (
+            id SERIAL PRIMARY KEY,
+            channel_username TEXT UNIQUE,
+            reward REAL DEFAULT 0.0
+        )
+    ''')
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             parent_id INTEGER DEFAULT NULL,
             name TEXT NOT NULL,
             price REAL DEFAULT NULL
@@ -66,192 +77,111 @@ def init_db():
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             category_id INTEGER,
             code_text TEXT,
             is_used INTEGER DEFAULT 0,
-            used_by INTEGER DEFAULT NULL
+            used_by BIGINT DEFAULT NULL
         )
     ''')
 
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, is_authorized) VALUES (?, 999999.0, 1)", (ADMIN_ID,))
-    cursor.execute("UPDATE users SET is_authorized = 1 WHERE user_id = ?", (ADMIN_ID,))
+    cursor.execute("INSERT INTO users (user_id, balance, is_authorized, user_type) VALUES (%s, 999999.0, 1, 'reseller') ON CONFLICT (user_id) DO UPDATE SET is_authorized = 1, user_type='reseller'", (ADMIN_ID,))
 
     conn.commit()
+    cursor.close()
     conn.close()
 
 init_db()
 
-def is_authorized(user_id, username=None):
-    if user_id == ADMIN_ID:
-        return True
-    
+def get_setting(key, default=""):
     conn = get_db()
     cursor = conn.cursor()
-    
-    cursor.execute("SELECT is_authorized FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT value FROM settings WHERE key=%s", (key,))
     row = cursor.fetchone()
-    if row and row['is_authorized'] == 1:
-        conn.close()
-        return True
-        
-    if username:
-        clean_username = username.lstrip('@').lower()
-        cursor.execute("SELECT rowid, is_authorized FROM users WHERE LOWER(username) = ?", (clean_username,))
-        row_u = cursor.fetchone()
-        if row_u and row_u['is_authorized'] == 1:
-            cursor.execute("UPDATE users SET user_id = ?, is_authorized = 1 WHERE LOWER(username) = ?", (user_id, clean_username))
-            conn.commit()
-            conn.close()
-            return True
-
+    cursor.close()
     conn.close()
-    return False
+    return row['value'] if row else default
 
-def main_menu(user_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("🛒 الأقسام والمنتجات", "👤 حسابي ورصيدي")
-    markup.row("💳 شحن رصيد")
+def check_forced_subs(user_id):
     if user_id == ADMIN_ID:
-        markup.row("⚙️ لوحة التحكم (للآدمن)")
-    return markup
+        return True
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM forced_channels")
+    channels = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    for ch in channels:
+        ch_username = ch['channel_username']
+        try:
+            member = bot.get_chat_member(ch_username, user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                return False
+        except Exception:
+            return False
+    return True
+
+def send_forced_channels_message(chat_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM forced_channels")
+    channels = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    markup = types.InlineKeyboardMarkup()
+    for ch in channels:
+        markup.add(types.InlineKeyboardButton(f"اشترك في قنواتنا 📢", url=f"https://t.me/{ch['channel_username'].lstrip('@')}"))
+    markup.add(types.InlineKeyboardButton("تحقق من الاشتراك ✅", callback_data="check_sub"))
+
+    bot.send_message(
+        chat_id,
+        "⚠️ عذراً، يجب عليك الاشتراكات في القنوات الإجبارية لتتمكن من استخدام البوت.\n"
+        "يرجى الاشتراك في القنوات أدناه ثم اضغط 'تحقق من الاشتراك':",
+        reply_markup=markup
+    )
 
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     user_id = message.from_user.id
     username = message.from_user.username
+    args = message.text.split()
 
     conn = get_db()
     cursor = conn.cursor()
+
+    invited_by = None
+    if len(args) > 1 and args[1].isdigit():
+        ref_id = int(args[1])
+        if ref_id != user_id:
+            invited_by = ref_id
+
     if username:
-        cursor.execute("INSERT INTO users (user_id, username, balance) VALUES (?, ?, 0.0) ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username", (user_id, username.lower()))
+        cursor.execute("""
+            INSERT INTO users (user_id, username, balance, invited_by) VALUES (%s, %s, 0.0, %s) 
+            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
+        """, (user_id, username.lower(), invited_by))
     else:
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0.0)", (user_id,))
+        cursor.execute("INSERT INTO users (user_id, balance, invited_by) VALUES (%s, 0.0, %s) ON CONFLICT (user_id) DO NOTHING", (user_id, invited_by))
     
-    cursor.execute("SELECT value FROM settings WHERE key='welcome_msg'")
-    welcome_msg = cursor.fetchone()['value']
     conn.commit()
-    conn.close()
-    
-    if not is_authorized(user_id, username):
-        safe_username = f"@{username}" if username else "غير محدد"
-        bot.reply_to(
-            message,
-            f"عفواً، هذا البوت خاص بالموزعين المعتمدين فقط.\n\n"
-            f"الآيدي (ID): {user_id}\n"
-            f"يوزرك: {safe_username}\n\n"
-            f"يرجى إرسال الآيدي أو اليوزر للمسؤول لتفعيل حسابك:\n"
-            f"المسؤول: {ADMIN_USERNAME}"
-        )
-        return
-
-    bot.send_message(user_id, welcome_msg, reply_markup=main_menu(user_id))
-
-@bot.message_handler(func=lambda m: True)
-def handle_text(message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    text = message.text
-
-    if not is_authorized(user_id, username):
-        return
-
-    if text == "👤 حسابي ورصيدي":
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        row = cursor.fetchone()
-        balance = row['balance'] if row else 0.0
-        conn.close()
-        bot.send_message(user_id, f"معرفك: {user_id}\nرصيدك الحالي: ${balance:.2f}")
-
-    elif text == "💳 شحن رصيد":
-        bot.send_message(
-            user_id,
-            f"لشحن رصيدك في البوت:\n\n"
-            f"يرجى التواصل مع الوكيل لشراء وتعبئة الرصيد:\n"
-            f"الوكيل: {ADMIN_USERNAME}"
-        )
-
-    elif text == "🛒 الأقسام والمنتجات":
-        show_user_categories(user_id, message.chat.id, parent_id=None)
-
-    elif text == "⚙️ لوحة التحكم (للآدمن)" and user_id == ADMIN_ID:
-        show_admin_panel(user_id, message.chat.id)
-
-def show_user_categories(user_id, chat_id, parent_id=None, message_id=None):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    if parent_id is None:
-        cursor.execute("SELECT * FROM categories WHERE parent_id IS NULL")
-        title = "الأقسام الرئيسية:"
-    else:
-        cursor.execute("SELECT * FROM categories WHERE id=?", (parent_id,))
-        current_cat = cursor.fetchone()
-        
-        if current_cat and current_cat['price'] is not None:
-            cursor.execute("SELECT COUNT(*) as count FROM codes WHERE category_id=? AND is_used=0", (parent_id,))
-            stock = cursor.fetchone()['count']
-            
-            text = f"السلعة: {current_cat['name']}\nالسعر: ${current_cat['price']:.2f}\nالمتوفر: {stock} كود"
-            
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("شراء الآن", callback_data=f"buy_prod_{parent_id}"))
-            
-            back_id = current_cat['parent_id']
-            back_cb = f"usr_cat_{back_id}" if back_id else "usr_cat_root"
-            markup.add(types.InlineKeyboardButton("رجوع", callback_data=back_cb))
-            
-            conn.close()
-            if message_id:
-                bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
-            else:
-                bot.send_message(chat_id, text, reply_markup=markup)
-            return
-
-        cursor.execute("SELECT * FROM categories WHERE parent_id=?", (parent_id,))
-        title = f"قسم: {current_cat['name']}"
-
-    cats = cursor.fetchall()
-    markup = types.InlineKeyboardMarkup()
-
-    for c in cats:
-        prefix = "🛒" if c['price'] is not None else "📁"
-        price_str = f" (${c['price']:.2f})" if c['price'] is not None else ""
-        markup.add(types.InlineKeyboardButton(f"{prefix} {c['name']}{price_str}", callback_data=f"usr_cat_{c['id']}"))
-
-    if parent_id is not None:
-        cursor.execute("SELECT parent_id FROM categories WHERE id=?", (parent_id,))
-        p = cursor.fetchone()
-        back_cb = f"usr_cat_{p['parent_id']}" if p and p['parent_id'] else "usr_cat_root"
-        markup.add(types.InlineKeyboardButton("رجوع", callback_data=back_cb))
-
+    cursor.close()
     conn.close()
 
-    if not cats and parent_id is None:
-        bot.send_message(chat_id, "لا توجد أقسام متوفرة حالياً.")
+    if not check_forced_subs(user_id):
+        send_forced_channels_message(message.chat.id)
         return
 
-    if message_id:
-        try:
-            bot.edit_message_text(title, chat_id, message_id, reply_markup=markup)
-        except Exception:
-            bot.send_message(chat_id, title, reply_markup=markup)
-    else:
-        bot.send_message(chat_id, title, reply_markup=markup)
+    show_start_options(message.chat.id)
 
-def show_admin_panel(user_id, chat_id, message_id=None):
+def show_start_options(chat_id, message_id=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("➕ إضافة موزع معتمد", callback_data="adm_add_reseller"),
-        types.InlineKeyboardButton("👥 الموزعين الحاليين", callback_data="adm_list_resellers"),
-        types.InlineKeyboardButton("📂 إدارة الأقسام والسلع", callback_data="adm_tree_0"),
-        types.InlineKeyboardButton("💰 شحن رصيد مستخدم", callback_data="adm_add_balance"),
-        types.InlineKeyboardButton("📝 تعديل رسالة الترحيب", callback_data="adm_edit_welcome"),
-        types.InlineKeyboardButton("📊 الإحصائيات العامة", callback_data="adm_stats")
+        types.InlineKeyboardButton("👔 أريد أن أكون موزعاً", callback_data="type_reseller"),
+        types.InlineKeyboardButton("👤 مستخدم عادي (مجاني)", callback_data="type_normal")
     )
-    text = "لوحة التحكم الرئيسية (الآدمن):"
+    text = "👋 أهلاً بك في البوت!\n\nاختر نوع استخدامك للبوت:"
     if message_id:
         try:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
@@ -260,71 +190,23 @@ def show_admin_panel(user_id, chat_id, message_id=None):
     else:
         bot.send_message(chat_id, text, reply_markup=markup)
 
-def show_admin_tree(chat_id, parent_id=0, message_id=None):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    real_parent_id = None if parent_id == 0 else parent_id
-
-    if real_parent_id is None:
-        cursor.execute("SELECT * FROM categories WHERE parent_id IS NULL")
-        title = "شجرة الأقسام (المستوى الرئيسي):"
-    else:
-        cursor.execute("SELECT * FROM categories WHERE id=?", (real_parent_id,))
-        current = cursor.fetchone()
-        
-        if current and current['price'] is not None:
-            cursor.execute("SELECT COUNT(*) as count FROM codes WHERE category_id=? AND is_used=0", (real_parent_id,))
-            stock = cursor.fetchone()['count']
-            text = f"إدارة السلعة: {current['name']}\nالسعر: ${current['price']:.2f}\nالأكواد المتوفرة: {stock}"
-            
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("رفع أكواد جديدة", callback_data=f"adm_up_codes_{real_parent_id}"))
-            markup.add(types.InlineKeyboardButton("حذف هذه السلعة", callback_data=f"adm_del_{real_parent_id}"))
-            
-            back_id = current['parent_id'] if current['parent_id'] else 0
-            markup.add(types.InlineKeyboardButton("رجوع", callback_data=f"adm_tree_{back_id}"))
-            
-            conn.close()
-            if message_id:
-                bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
-            else:
-                bot.send_message(chat_id, text, reply_markup=markup)
-            return
-
-        cursor.execute("SELECT * FROM categories WHERE parent_id=?", (real_parent_id,))
-        title = f"إدارة قسم: {current['name']}"
-
-    children = cursor.fetchall()
-    markup = types.InlineKeyboardMarkup()
-
+def show_main_inline_menu(chat_id, message_id=None):
+    markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("➕ إضافة قسم فرعي", callback_data=f"adm_newcat_{parent_id}"),
-        types.InlineKeyboardButton("➕ إضافة سلعة بسعر", callback_data=f"adm_newprd_{parent_id}")
+        types.InlineKeyboardButton("🛍️ المتجر", callback_data="menu_store"),
+        types.InlineKeyboardButton("💰 رصيدي", callback_data="menu_balance"),
+        types.InlineKeyboardButton("📋 طلباتي", callback_data="menu_orders"),
+        types.InlineKeyboardButton("👥 تجميع رصيد (دعوة أصدقاء)", callback_data="menu_ref"),
+        types.InlineKeyboardButton("📢 قنوات ربح الرصيد", callback_data="menu_earn_channels")
     )
-
-    for c in children:
-        prefix = "🛒" if c['price'] is not None else "📁"
-        price_str = f" (${c['price']:.2f})" if c['price'] is not None else ""
-        markup.add(types.InlineKeyboardButton(f"{prefix} {c['name']}{price_str}", callback_data=f"adm_tree_{c['id']}"))
-
-    if real_parent_id is not None:
-        markup.add(types.InlineKeyboardButton("🗑️ حذف هذا القسم", callback_data=f"adm_del_{real_parent_id}"))
-        cursor.execute("SELECT parent_id FROM categories WHERE id=?", (real_parent_id,))
-        p = cursor.fetchone()
-        back_id = p['parent_id'] if p and p['parent_id'] else 0
-        markup.add(types.InlineKeyboardButton("رجوع للأعلى", callback_data=f"adm_tree_{back_id}"))
-    else:
-        markup.add(types.InlineKeyboardButton("العودة للوحة التحكم", callback_data="adm_main_menu"))
-
-    conn.close()
+    text = "👋 أهلاً بك في القائمة الرئيسية!\n\nاختر من القائمة:"
     if message_id:
         try:
-            bot.edit_message_text(title, chat_id, message_id, reply_markup=markup)
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
         except Exception:
-            bot.send_message(chat_id, title, reply_markup=markup)
+            bot.send_message(chat_id, text, reply_markup=markup)
     else:
-        bot.send_message(chat_id, title, reply_markup=markup)
+        bot.send_message(chat_id, text, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
@@ -334,11 +216,114 @@ def callback_handler(call):
     message_id = call.message.message_id
     data = call.data
 
-    if not is_authorized(user_id, username):
-        bot.answer_callback_query(call.id, "ليس لديك صلاحية لاستخدام البوت.", show_alert=True)
+    if data == "check_sub":
+        if check_forced_subs(user_id):
+            bot.answer_callback_query(call.id, "شكراً لاشتراكك!")
+            show_start_options(chat_id, message_id)
+        else:
+            bot.answer_callback_query(call.id, "لم تقم بالاشتراك في كافة القنوات بعد!", show_alert=True)
         return
 
-    if data == "usr_cat_root":
+    if not check_forced_subs(user_id):
+        send_forced_channels_message(chat_id)
+        return
+
+    if data == "type_reseller":
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET user_type='reseller' WHERE user_id=%s", (user_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        bot.edit_message_text(
+            f"عفواً، يتطلب حساب الموزع موافقة الإدارة.\n\n"
+            f"الآيدي الخاص بك: `{user_id}`\n"
+            f"يرجى مراسلة المسؤول لتفعيل حسابك كموزع:\n"
+            f"المسؤول: {ADMIN_USERNAME}",
+            chat_id, message_id, parse_mode="Markdown"
+        )
+
+    elif data == "type_normal":
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET user_type='normal' WHERE user_id=%s", (user_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        show_main_inline_menu(chat_id, message_id)
+
+    elif data == "menu_store":
+        show_user_categories(user_id, chat_id, parent_id=None, message_id=message_id)
+
+    elif data == "menu_balance":
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM users WHERE user_id=%s", (user_id,))
+        row = cursor.fetchone()
+        bal = row['balance'] if row else 0.0
+        cursor.close()
+        conn.close()
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
+        bot.edit_message_text(f"👤 معرفك: `{user_id}`\n💰 رصيدك الحالي: ${bal:.2f}\n\nيمكنك شحن رصيدك عبر التواصل مع المدير: {ADMIN_USERNAME}", chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data == "menu_orders":
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.name, cd.code_text FROM codes cd 
+            JOIN categories c ON cd.category_id = c.id 
+            WHERE cd.used_by = %s
+        """, (user_id,))
+        orders = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        text = "📋 مشترياتك السابقة:\n\n"
+        if orders:
+            for o in orders:
+                text += f"▫️ {o['name']} ⟵ `{o['code_text']}`\n"
+        else:
+            text += "لا توجد طلبات سابقة."
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data == "menu_ref":
+        bot_info = bot.get_me()
+        ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+        reward = get_setting('ref_reward', '0.5')
+        
+        text = (
+            f"👥 **نظام دعوة الأصدقاء**\n\n"
+            f"شارك رابط الدعوة الخاص بك مع أصدقائك، واكسب ${reward} عن كل شخص يدخل ويشترك بالقنوات الإجبارية!\n\n"
+            f"🔗 رابطك:\n`{ref_link}`"
+        )
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data == "menu_earn_channels":
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM forced_channels")
+        channels = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        markup = types.InlineKeyboardMarkup()
+        for ch in channels:
+            markup.add(types.InlineKeyboardButton(f"قناة: {ch['channel_username']} (ربح ${ch['reward']})", url=f"https://t.me/{ch['channel_username'].lstrip('@')}"))
+        markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
+        
+        bot.edit_message_text("📢 القنوات المتاحة للاشتراك وجمع الرصيد:", chat_id, message_id, reply_markup=markup)
+
+    elif data == "back_to_main":
+        show_main_inline_menu(chat_id, message_id)
+
+    elif data == "usr_cat_root":
         show_user_categories(user_id, chat_id, parent_id=None, message_id=message_id)
 
     elif data.startswith("usr_cat_"):
@@ -351,258 +336,260 @@ def callback_handler(call):
 
     elif user_id == ADMIN_ID:
         if data == "adm_main_menu":
-            show_admin_panel(user_id, chat_id, message_id)
-
-        elif data == "adm_add_reseller":
-            msg = bot.send_message(chat_id, "أرسل الآن الآيدي (ID) أو اليوزر الخاص بالموزع:")
-            bot.register_next_step_handler(msg, process_add_reseller)
-
-        elif data == "adm_list_resellers":
-            show_resellers_list(chat_id, message_id)
-
-        elif data.startswith("adm_resinfo_"):
-            target_uid = int(data.split("_")[2])
-            show_single_reseller_info(chat_id, target_uid, message_id)
-
-        elif data.startswith("adm_delres_"):
-            target_uid = int(data.split("_")[2])
+            show_admin_panel(chat_id, message_id)
+        elif data == "adm_channels":
+            show_admin_channels(chat_id, message_id)
+        elif data == "adm_add_channel":
+            msg = bot.send_message(chat_id, "أرسل معرف القناة ورصيد المكافأة بالشكل التالي (مثال: @MyChannel 0.5):")
+            bot.register_next_step_handler(msg, save_forced_channel)
+        elif data.startswith("adm_delchan_"):
+            chan_id = int(data.split("_")[2])
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM users WHERE user_id=? AND user_id!=?", (target_uid, ADMIN_ID))
+            cursor.execute("DELETE FROM forced_channels WHERE id=%s", (chan_id,))
             conn.commit()
+            cursor.close()
             conn.close()
-            bot.answer_callback_query(call.id, "تم حذف الموزع بنجاح!")
-            show_resellers_list(chat_id, message_id)
-
-        elif data.startswith("adm_addbalto_"):
-            target_uid = int(data.split("_")[2])
-            msg = bot.send_message(chat_id, "أرسل المبلغ المراد إضافته لهذا الموزع:")
-            bot.register_next_step_handler(msg, lambda m: process_direct_add_balance(m, target_uid))
-
+            bot.answer_callback_query(call.id, "تم حذف القناة!")
+            show_admin_channels(chat_id, message_id)
+        elif data == "adm_tree_0":
+            show_admin_tree(chat_id, parent_id=0, message_id=message_id)
         elif data.startswith("adm_tree_"):
             p_id = int(data.split("_")[2])
             show_admin_tree(chat_id, parent_id=p_id, message_id=message_id)
-
         elif data.startswith("adm_newcat_"):
             p_id = int(data.split("_")[2])
             msg = bot.send_message(chat_id, "أرسل اسم القسم الفرعي الجديد:")
             bot.register_next_step_handler(msg, lambda m: save_new_category(m, p_id))
-
         elif data.startswith("adm_newprd_"):
             p_id = int(data.split("_")[2])
-            msg = bot.send_message(chat_id, "أرسل اسم السلعة والسعر وبينهما شخطق - (مثال: يومي - 2.5)")
+            msg = bot.send_message(chat_id, "أرسل اسم السلعة والسعر وبينهما شخطه (مثال: شدات ببجي - 2.5):")
             bot.register_next_step_handler(msg, lambda m: save_new_product(m, p_id))
-
         elif data.startswith("adm_up_codes_"):
             cat_id = int(data.split("_")[3])
             msg = bot.send_message(chat_id, "أرسل الأكواد الآن (كل كود في سطر):")
             bot.register_next_step_handler(msg, lambda m: save_uploaded_codes(m, cat_id))
-
         elif data.startswith("adm_del_"):
             cat_id = int(data.split("_")[2])
             delete_category_recursive(cat_id)
             bot.answer_callback_query(call.id, "تم الحذف بنجاح!")
             show_admin_tree(chat_id, parent_id=0, message_id=message_id)
 
-        elif data == "adm_add_balance":
-            msg = bot.send_message(chat_id, "أرسل آيدي المستخدم والمبلغ بمسافة بينهم (مثال: 12345 10)")
-            bot.register_next_step_handler(msg, process_add_balance)
+@bot.message_handler(commands=['admin'])
+def admin_cmd(message):
+    if message.from_user.id == ADMIN_ID:
+        show_admin_panel(message.chat.id)
 
-        elif data == "adm_edit_welcome":
-            msg = bot.send_message(chat_id, "أرسل رسالة الترحيب الجديدة:")
-            bot.register_next_step_handler(msg, process_edit_welcome)
+def show_admin_panel(chat_id, message_id=None):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📢 إدارة قنوات الاشتراك الإجباري والربح", callback_data="adm_channels"),
+        types.InlineKeyboardButton("📂 إدارة الأقسام والسلع والألعاب", callback_data="adm_tree_0")
+    )
+    text = "⚙️ لوحة تحكم الآدمن:"
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
 
-        elif data == "adm_stats":
-            conn = get_db()
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) as u FROM users WHERE is_authorized=1")
-            u_cnt = cursor.fetchone()['u']
-            cursor.execute("SELECT COUNT(*) as c FROM codes WHERE is_used=0")
-            c_cnt = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(*) as s FROM codes WHERE is_used=1")
-            s_cnt = cursor.fetchone()['s']
-
-            cursor.execute('''
-                SELECT c.name, COUNT(cd.id) as sold_count
-                FROM categories c
-                LEFT JOIN codes cd ON c.id = cd.category_id AND cd.is_used = 1
-                WHERE c.price IS NOT NULL
-                GROUP BY c.id, c.name
-            ''')
-            products_sales = cursor.fetchall()
-            conn.close()
-
-            sales_details = ""
-            for prod in products_sales:
-                sales_details += f"- {prod['name']}: {prod['sold_count']} كود\n"
-
-            if not sales_details:
-                sales_details = "لا توجد مبيعات حالياً.\n"
-
-            text = (
-                f"الإحصائيات العامة:\n\n"
-                f"الموزعين المعتمدين: {u_cnt}\n"
-                f"الأكواد المتاحة: {c_cnt}\n"
-                f"إجمالي الأكواد المباعة: {s_cnt}\n\n"
-                f"المبيعات حسب السلعة:\n{sales_details}"
-            )
-            bot.send_message(chat_id, text)
-
-def show_resellers_list(chat_id, message_id=None):
+def show_admin_channels(chat_id, message_id=None):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE is_authorized=1")
-    resellers = cursor.fetchall()
+    cursor.execute("SELECT * FROM forced_channels")
+    channels = cursor.fetchall()
+    cursor.close()
     conn.close()
 
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for r in resellers:
-        uname = f"@{r['username']}" if r['username'] else f"ID: {r['user_id']}"
-        markup.add(types.InlineKeyboardButton(f"{uname} (رصيد: ${r['balance']:.2f})", callback_data=f"adm_resinfo_{r['user_id']}"))
-
+    markup.add(types.InlineKeyboardButton("➕ إضافة قناة جديدة", callback_data="adm_add_channel"))
+    for ch in channels:
+        markup.add(types.InlineKeyboardButton(f"🗑️ حذف {ch['channel_username']} (${ch['reward']})", callback_data=f"adm_delchan_{ch['id']}"))
     markup.add(types.InlineKeyboardButton("رجوع للوحة التحكم", callback_data="adm_main_menu"))
-    
-    text = "قائمة الموزعين المعتمدين:"
+
+    text = "📢 إدارة القنوات:"
     if message_id:
-        try:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
-        except Exception:
-            bot.send_message(chat_id, text, reply_markup=markup)
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
     else:
         bot.send_message(chat_id, text, reply_markup=markup)
 
-def show_single_reseller_info(chat_id, target_uid, message_id=None):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE user_id=?", (target_uid,))
-    res = cursor.fetchone()
-
-    if not res:
-        conn.close()
-        bot.send_message(chat_id, "لم يتم العثور على هذا المستخدم.")
-        return
-
-    cursor.execute("SELECT COUNT(*) as pulled FROM codes WHERE used_by=?", (target_uid,))
-    pulled_count = cursor.fetchone()['pulled']
-    conn.close()
-
-    uname = f"@{res['username']}" if res['username'] else "بدون يوزر"
-    text = (
-        f"معلومات الموزع:\n\n"
-        f"الآيدي: {res['user_id']}\n"
-        f"اليوزر: {uname}\n"
-        f"الرصيد الحالي: ${res['balance']:.2f}\n"
-        f"الأكواد المسحوبة: {pulled_count}"
-    )
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("➕ رصيد", callback_data=f"adm_addbalto_{target_uid}"),
-        types.InlineKeyboardButton("🗑️ حذف", callback_data=f"adm_delres_{target_uid}")
-    )
-    markup.add(types.InlineKeyboardButton("رجوع للقائمة", callback_data="adm_list_resellers"))
-
-    if message_id:
-        try:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
-        except Exception:
-            bot.send_message(chat_id, text, reply_markup=markup)
-    else:
-        bot.send_message(chat_id, text, reply_markup=markup)
-
-def process_direct_add_balance(message, target_uid):
+def save_forced_channel(message):
     try:
-        amount = float(message.text.strip())
+        parts = message.text.split()
+        ch_name = parts[0]
+        reward = float(parts[1])
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, target_uid))
+        cursor.execute("INSERT INTO forced_channels (channel_username, reward) VALUES (%s, %s) ON CONFLICT (channel_username) DO UPDATE SET reward = EXCLUDED.reward", (ch_name, reward))
         conn.commit()
-        
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (target_uid,))
-        new_bal = cursor.fetchone()['balance']
+        cursor.close()
         conn.close()
-
-        bot.send_message(message.chat.id, f"تم إضافة ${amount} بنجاح! الرصيد الجديد: ${new_bal:.2f}")
-        try:
-            bot.send_message(target_uid, f"تم شحن حسابك بمبلغ ${amount}! رصيدك الحالي: ${new_bal:.2f}")
-        except Exception:
-            pass
-        
-        show_single_reseller_info(message.chat.id, target_uid)
+        bot.send_message(message.chat.id, "تمت إضافة القناة بنجاح!")
+        show_admin_channels(message.chat.id)
     except Exception:
-        bot.send_message(message.chat.id, "خطأ في القيمة. أرسل رقماً صحيحاً.")
+        bot.send_message(message.chat.id, "خطأ بالصيغة! استخدم المثال: @ChannelName 0.5")
 
-def process_add_reseller(message):
-    text = message.text.strip()
+def show_user_categories(user_id, chat_id, parent_id=None, message_id=None):
     conn = get_db()
     cursor = conn.cursor()
 
-    if text.isdigit():
-        target_id = int(text)
-        cursor.execute("INSERT OR REPLACE INTO users (user_id, balance, is_authorized) VALUES (?, COALESCE((SELECT balance FROM users WHERE user_id=?), 0.0), 1)", (target_id, target_id))
-        conn.commit()
-        conn.close()
-        bot.send_message(message.chat.id, f"تم تفعيل الموزع بالآيدي {target_id} بنجاح!")
-        try:
-            bot.send_message(target_id, "تم تفعيل حسابك كموزع معتمد! اضغط /start")
-        except Exception:
-            pass
+    if parent_id is None:
+        cursor.execute("SELECT * FROM categories WHERE parent_id IS NULL")
+        title = "🛒 أقسام المتجر (ببجي، بليارد، أوكسيد وغيرها):"
     else:
-        clean_username = text.lstrip('@').strip().lower()
-        cursor.execute("SELECT user_id FROM users WHERE LOWER(username) = ?", (clean_username,))
-        row = cursor.fetchone()
+        cursor.execute("SELECT * FROM categories WHERE id=%s", (parent_id,))
+        current_cat = cursor.fetchone()
         
-        if row and row['user_id']:
-            cursor.execute("UPDATE users SET is_authorized = 1 WHERE LOWER(username) = ?", (clean_username,))
-            conn.commit()
+        if current_cat and current_cat['price'] is not None:
+            cursor.execute("SELECT COUNT(*) as count FROM codes WHERE category_id=%s AND is_used=0", (parent_id,))
+            stock = cursor.fetchone()['count']
+            
+            text = f"السلعة: {current_cat['name']}\nالسعر: ${current_cat['price']:.2f}\nالمتوفر: {stock} كود"
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("شراء الآن", callback_data=f"buy_prod_{parent_id}"))
+            
+            back_id = current_cat['parent_id']
+            back_cb = f"usr_cat_{back_id}" if back_id is not None else "usr_cat_root"
+            markup.add(types.InlineKeyboardButton("رجوع", callback_data=back_cb))
+            
+            cursor.close()
             conn.close()
-            bot.send_message(message.chat.id, f"تم تفعيل الموزع @{clean_username} بنجاح!")
-            try:
-                bot.send_message(row['user_id'], "تم تفعيل حسابك كموزع معتمد! اضغط /start")
-            except Exception:
-                pass
-        else:
-            cursor.execute("INSERT OR IGNORE INTO users (username, is_authorized) VALUES (?, 1)", (clean_username,))
-            conn.commit()
+            if message_id:
+                bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+            else:
+                bot.send_message(chat_id, text, reply_markup=markup)
+            return
+
+        cursor.execute("SELECT * FROM categories WHERE parent_id=%s", (parent_id,))
+        title = f"قسم: {current_cat['name']}"
+
+    cats = cursor.fetchall()
+    markup = types.InlineKeyboardMarkup()
+
+    for c in cats:
+        prefix = "🛒" if c['price'] is not None else "📁"
+        price_str = f" (${c['price']:.2f})" if c['price'] is not None else ""
+        markup.add(types.InlineKeyboardButton(f"{prefix} {c['name']}{price_str}", callback_data=f"usr_cat_{c['id']}"))
+
+    if parent_id is not None:
+        cursor.execute("SELECT parent_id FROM categories WHERE id=%s", (parent_id,))
+        p = cursor.fetchone()
+        back_cb = f"usr_cat_{p['parent_id']}" if p and p['parent_id'] is not None else "usr_cat_root"
+        markup.add(types.InlineKeyboardButton("رجوع", callback_data=back_cb))
+    else:
+        markup.add(types.InlineKeyboardButton("رجوع للقائمة الرئيسية", callback_data="back_to_main"))
+
+    cursor.close()
+    conn.close()
+
+    if message_id:
+        try:
+            bot.edit_message_text(title, chat_id, message_id, reply_markup=markup)
+        except Exception:
+            bot.send_message(chat_id, title, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, title, reply_markup=markup)
+
+def show_admin_tree(chat_id, parent_id=0, message_id=None):
+    conn = get_db()
+    cursor = conn.cursor()
+    real_parent_id = None if parent_id == 0 else parent_id
+
+    if real_parent_id is None:
+        cursor.execute("SELECT * FROM categories WHERE parent_id IS NULL")
+        title = "شجرة الأقسام الرئيسية:"
+    else:
+        cursor.execute("SELECT * FROM categories WHERE id=%s", (real_parent_id,))
+        current = cursor.fetchone()
+        
+        if current and current['price'] is not None:
+            cursor.execute("SELECT COUNT(*) as count FROM codes WHERE category_id=%s AND is_used=0", (real_parent_id,))
+            stock = cursor.fetchone()['count']
+            text = f"إدارة السلعة: {current['name']}\nالسعر: ${current['price']:.2f}\nالأكواد المتوفرة: {stock}"
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("رفع أكواد جديدة", callback_data=f"adm_up_codes_{real_parent_id}"))
+            markup.add(types.InlineKeyboardButton("حذف هذه السلعة", callback_data=f"adm_del_{real_parent_id}"))
+            back_id = current['parent_id'] if current['parent_id'] is not None else 0
+            markup.add(types.InlineKeyboardButton("رجوع", callback_data=f"adm_tree_{back_id}"))
+            
+            cursor.close()
             conn.close()
-            bot.send_message(message.chat.id, f"تم إضافة @{clean_username} وسيتم تفعيله تلقائياً عند دخوله للبوت.")
+            if message_id:
+                bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+            else:
+                bot.send_message(chat_id, text, reply_markup=markup)
+            return
+
+        cursor.execute("SELECT * FROM categories WHERE parent_id=%s", (real_parent_id,))
+        title = f"إدارة قسم: {current['name']}"
+
+    children = cursor.fetchall()
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("➕ إضافة قسم فرعي", callback_data=f"adm_newcat_{parent_id}"),
+        types.InlineKeyboardButton("➕ إضافة سلعة/لعبة بسعر", callback_data=f"adm_newprd_{parent_id}")
+    )
+
+    for c in children:
+        prefix = "🛒" if c['price'] is not None else "📁"
+        price_str = f" (${c['price']:.2f})" if c['price'] is not None else ""
+        markup.add(types.InlineKeyboardButton(f"{prefix} {c['name']}{price_str}", callback_data=f"adm_tree_{c['id']}"))
+
+    if real_parent_id is not None:
+        markup.add(types.InlineKeyboardButton("🗑️ حذف هذا القسم", callback_data=f"adm_del_{real_parent_id}"))
+        cursor.execute("SELECT parent_id FROM categories WHERE id=%s", (real_parent_id,))
+        p = cursor.fetchone()
+        back_id = p['parent_id'] if p and p['parent_id'] is not None else 0
+        markup.add(types.InlineKeyboardButton("رجوع للأعلى", callback_data=f"adm_tree_{back_id}"))
+    else:
+        markup.add(types.InlineKeyboardButton("العودة للوحة التحكم", callback_data="adm_main_menu"))
+
+    cursor.close()
+    conn.close()
+    if message_id:
+        bot.edit_message_text(title, chat_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, title, reply_markup=markup)
 
 def process_buy_code(user_id, chat_id, cat_id, callback_id):
     conn = get_db()
     cursor = conn.cursor()
-
-    cursor.execute("SELECT * FROM categories WHERE id=?", (cat_id,))
+    cursor.execute("SELECT * FROM categories WHERE id=%s", (cat_id,))
     cat = cursor.fetchone()
-
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    cursor.execute("SELECT balance FROM users WHERE user_id=%s", (user_id,))
     user_row = cursor.fetchone()
     user_balance = user_row['balance'] if user_row else 0.0
 
     if not cat or cat['price'] is None:
         bot.answer_callback_query(callback_id, "خطأ في المنتج.")
+        cursor.close()
         conn.close()
         return
 
     if user_balance < cat['price']:
         bot.answer_callback_query(callback_id, "رصيدك غير كافٍ للشراء!", show_alert=True)
+        cursor.close()
         conn.close()
         return
 
-    cursor.execute("SELECT id, code_text FROM codes WHERE category_id=? AND is_used=0 LIMIT 1", (cat_id,))
+    cursor.execute("SELECT id, code_text FROM codes WHERE category_id=%s AND is_used=0 LIMIT 1", (cat_id,))
     code_row = cursor.fetchone()
 
     if not code_row:
         bot.answer_callback_query(callback_id, "لا توجد أكواد متوفرة حالياً.", show_alert=True)
+        cursor.close()
         conn.close()
         return
 
     new_balance = user_balance - cat['price']
-    cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, user_id))
-    cursor.execute("UPDATE codes SET is_used=1, used_by=? WHERE id=?", (user_id, code_row['id']))
+    cursor.execute("UPDATE users SET balance=%s WHERE user_id=%s", (new_balance, user_id))
+    cursor.execute("UPDATE codes SET is_used=1, used_by=%s WHERE id=%s", (user_id, code_row['id']))
     conn.commit()
+    cursor.close()
     conn.close()
 
-    bot.send_message(chat_id, f"تم الشراء بنجاح!\n\nالسلعة: {cat['name']}\nالكود الخاص بك:\n{code_row['code_text']}\n\nالرصيد المتبقي: ${new_balance:.2f}")
+    bot.send_message(chat_id, f"تم الشراء بنجاح!\n\nالسلعة: {cat['name']}\nالكود الخاص بك:\n`{code_row['code_text']}`\n\nالرصيد المتبقي: ${new_balance:.2f}", parse_mode="Markdown")
     bot.answer_callback_query(callback_id, "تم التسليم بنجاح!")
 
 def save_new_category(message, parent_id):
@@ -610,8 +597,9 @@ def save_new_category(message, parent_id):
     p_id = None if parent_id == 0 else parent_id
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO categories (parent_id, name) VALUES (?, ?)", (p_id, name))
+    cursor.execute("INSERT INTO categories (parent_id, name) VALUES (%s, %s)", (p_id, name))
     conn.commit()
+    cursor.close()
     conn.close()
     bot.send_message(message.chat.id, f"تم إنشاء القسم {name} بنجاح!")
     show_admin_tree(message.chat.id, parent_id=parent_id)
@@ -625,25 +613,26 @@ def save_new_product(message, parent_id):
 
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO categories (parent_id, name, price) VALUES (?, ?, ?)", (p_id, name, price))
+        cursor.execute("INSERT INTO categories (parent_id, name, price) VALUES (%s, %s, %s)", (p_id, name, price))
         conn.commit()
+        cursor.close()
         conn.close()
         bot.send_message(message.chat.id, f"تم إضافة السلعة {name} بسعر ${price:.2f} بنجاح!")
         show_admin_tree(message.chat.id, parent_id=parent_id)
     except Exception:
-        bot.send_message(message.chat.id, "خطأ بالصيغة! استخدم الشخطة (مثال: يومي - 2.5).")
+        bot.send_message(message.chat.id, "خطأ بالصيغة! استخدم الشخطة (مثال: شدات ببجي - 2.5).")
 
 def save_uploaded_codes(message, cat_id):
     codes = [c.strip() for c in message.text.split('\n') if c.strip()]
     if not codes:
         bot.send_message(message.chat.id, "لم يتم إرسال أي أكواد.")
         return
-
     conn = get_db()
     cursor = conn.cursor()
     for code in codes:
-        cursor.execute("INSERT INTO codes (category_id, code_text) VALUES (?, ?)", (cat_id, code))
+        cursor.execute("INSERT INTO codes (category_id, code_text) VALUES (%s, %s)", (cat_id, code))
     conn.commit()
+    cursor.close()
     conn.close()
     bot.send_message(message.chat.id, f"تم رفع {len(codes)} كود بنجاح!")
     show_admin_tree(message.chat.id, parent_id=cat_id)
@@ -651,52 +640,19 @@ def save_uploaded_codes(message, cat_id):
 def delete_category_recursive(cat_id):
     conn = get_db()
     cursor = conn.cursor()
-    
     def _delete(c_id):
-        cursor.execute("SELECT id FROM categories WHERE parent_id=?", (c_id,))
-        children = cursor.fetchall()
-        for child in children:
+        cursor.execute("SELECT id FROM categories WHERE parent_id=%s", (c_id,))
+        for child in cursor.fetchall():
             _delete(child['id'])
-        cursor.execute("DELETE FROM codes WHERE category_id=?", (c_id,))
-        cursor.execute("DELETE FROM categories WHERE id=?", (c_id,))
-
+        cursor.execute("DELETE FROM codes WHERE category_id=%s", (c_id,))
+        cursor.execute("DELETE FROM categories WHERE id=%s", (c_id,))
     _delete(cat_id)
     conn.commit()
+    cursor.close()
     conn.close()
 
-def process_add_balance(message):
-    try:
-        parts = message.text.split()
-        target_id = int(parts[0])
-        amount = float(parts[1])
-
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, is_authorized) VALUES (?, 0.0, 1)", (target_id,))
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, target_id))
-        conn.commit()
-        conn.close()
-
-        bot.send_message(message.chat.id, f"تم شحن ${amount} للمستخدم {target_id}")
-        try:
-            bot.send_message(target_id, f"تم شحن حسابك بمبلغ ${amount} بنجاح!")
-        except Exception:
-            pass
-    except Exception:
-        bot.send_message(message.chat.id, "صيغة خاطئة. أرسل الآيدي والمبلغ بمسافة بينهما.")
-
-def process_edit_welcome(message):
-    new_msg = message.text
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE settings SET value=? WHERE key='welcome_msg'", (new_msg,))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, "تم تحديث رسالة الترحيب بنجاح!")
-
-# --- تشغيل السيرفر الوهمي والبوت معاً ---
 if __name__ == '__main__':
     print("تشغيل خادم الويب الوهمي للحفاظ على اتصال Render...")
     keep_alive()
-    print("البوت يعمل الآن بدون أخطاء...")
+    print("البوت يعمل الآن بنجاح...")
     bot.infinity_polling()
